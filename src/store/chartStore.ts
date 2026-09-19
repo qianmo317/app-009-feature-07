@@ -1,6 +1,14 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { Chart, Tool, Point, Rect } from '../types';
+import {
+  MAX_SELECTION_CELLS,
+  clampRectToCanvas,
+  extractRegion,
+  fillRegion,
+  flipRegion,
+  selectionTooLarge,
+} from '../utils/selection';
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -22,6 +30,8 @@ function createEmptyChart(cols = 64, rows = 64, title = '未命名图解'): Char
   };
 }
 
+export type Notice = { id: number; message: string; kind: 'info' | 'warn' };
+
 interface AppState {
   charts: Chart[];
   currentChartId: string | null;
@@ -36,6 +46,7 @@ interface AppState {
   selection: Rect | null;
   isSelecting: boolean;
   showGrid: boolean;
+  notice: Notice | null;
 }
 
 interface AppActions {
@@ -56,7 +67,37 @@ interface AppActions {
   setSelection: (r: Rect | null) => void;
   setIsSelecting: (v: boolean) => void;
   setShowGrid: (v: boolean) => void;
+  notify: (message: string, kind?: 'info' | 'warn') => void;
+  clearNotice: () => void;
+  copySelection: () => void;
+  fillSelection: () => void;
+  flipSelection: (axis: 'horizontal' | 'vertical') => void;
+  clearSelectionToBackground: () => void;
   getCurrentChart: () => Chart | null;
+}
+
+// 选区操作的统一守卫：没图解 / 没框选 / 框太大 / 框不在画布内时拦截并说明原因
+function guardSelection(get: () => AppState & AppActions): { chart: Chart; rect: Rect } | null {
+  const s = get();
+  const chart = s.getCurrentChart();
+  if (!chart) return null;
+  if (!s.selection) {
+    s.notify('请先用「选择」工具框选一块区域', 'warn');
+    return null;
+  }
+  if (selectionTooLarge(s.selection)) {
+    s.notify(
+      `选区太大（${s.selection.w}×${s.selection.h}，共 ${s.selection.w * s.selection.h} 格），一次最多处理 ${MAX_SELECTION_CELLS} 格，请缩小框选范围`,
+      'warn'
+    );
+    return null;
+  }
+  const rect = clampRectToCanvas(s.selection, chart.cols, chart.rows);
+  if (!rect) {
+    s.notify('选区不在画布范围内，请重新框选', 'warn');
+    return null;
+  }
+  return { chart, rect };
 }
 
 export const useChartStore = create<AppState & AppActions>()(
@@ -75,6 +116,7 @@ export const useChartStore = create<AppState & AppActions>()(
       selection: null,
       isSelecting: false,
       showGrid: true,
+      notice: null,
 
       createChart: (cols, rows, title) => {
         const chart = createEmptyChart(cols, rows, title);
@@ -125,6 +167,47 @@ export const useChartStore = create<AppState & AppActions>()(
       setSelection: (selection) => set({ selection }),
       setIsSelecting: (isSelecting) => set({ isSelecting }),
       setShowGrid: (showGrid) => set({ showGrid }),
+
+      notify: (message, kind = 'info') => set({ notice: { id: Date.now() + Math.random(), message, kind } }),
+      clearNotice: () => set({ notice: null }),
+
+      copySelection: () => {
+        const g = guardSelection(get);
+        if (!g) return;
+        const { chart, rect } = g;
+        get().setClipboard({ cells: extractRegion(chart.cells, chart.cols, rect), cols: rect.w, rows: rect.h });
+        get().notify(`已复制 ${rect.w}×${rect.h} 区域`);
+      },
+
+      fillSelection: () => {
+        const g = guardSelection(get);
+        if (!g) return;
+        const { chart, rect } = g;
+        const idx = get().selectedColorIndex;
+        const cells = fillRegion(chart.cells, chart.cols, rect, idx);
+        get().updateChart(chart.id, (c) => ({ ...c, cells }));
+        get().notify(`已用「${chart.palette[idx]?.name ?? '当前色'}」填充 ${rect.w}×${rect.h} 区域`);
+      },
+
+      flipSelection: (axis) => {
+        const g = guardSelection(get);
+        if (!g) return;
+        const { chart, rect } = g;
+        const cells = flipRegion(chart.cells, chart.cols, rect, axis);
+        get().updateChart(chart.id, (c) => ({ ...c, cells }));
+        // 翻转后框的范围跟着更新，继续框住翻转后的内容
+        set({ selection: clampRectToCanvas(rect, chart.cols, chart.rows) });
+        get().notify(axis === 'horizontal' ? '已左右翻转选中区域' : '已上下翻转选中区域');
+      },
+
+      clearSelectionToBackground: () => {
+        const g = guardSelection(get);
+        if (!g) return;
+        const { chart, rect } = g;
+        const cells = fillRegion(chart.cells, chart.cols, rect, 0);
+        get().updateChart(chart.id, (c) => ({ ...c, cells }));
+        get().notify(`已把 ${rect.w}×${rect.h} 区域清成底色`);
+      },
 
       getCurrentChart: () => {
         const { charts, currentChartId } = get();

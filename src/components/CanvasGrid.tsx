@@ -1,6 +1,14 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import { useChartStore } from '../store/chartStore';
 import type { Chart, Point, Rect } from '../types';
+import {
+  MAX_SELECTION_CELLS,
+  blitRegion,
+  clampRectToCanvas,
+  extractRegion,
+  fillRegion,
+  selectionTooLarge,
+} from '../utils/selection';
 
 const BASE_CELL = 20;
 
@@ -24,7 +32,6 @@ export default function CanvasGrid() {
     setLastPanPoint,
     setSelection,
     setIsSelecting,
-    setClipboard,
     setSelectedColorIndex,
   } = useChartStore();
 
@@ -38,6 +45,19 @@ export default function CanvasGrid() {
   const currentCellsRef = useRef<Uint16Array | null>(null);
   const rafRef = useRef<number>(0);
   const needsRedrawRef = useRef(true);
+  // 选区移动状态：buf 为抠出的内容，原位置已清成底色，松手时按 (origX+dx, origY+dy) 贴回
+  const moveRef = useRef<{
+    buf: Uint16Array;
+    w: number;
+    h: number;
+    origX: number;
+    origY: number;
+    startClientX: number;
+    startClientY: number;
+    dx: number;
+    dy: number;
+  } | null>(null);
+  const [hoverInSel, setHoverInSel] = useState(false);
 
   // Keep latest values in refs for animation loop and event handlers
   const stateRef = useRef({ chart: chartRef.current, scale, offset, showGrid, selection, tool, selectedColorIndex, mirrorAxis });
@@ -168,6 +188,23 @@ export default function CanvasGrid() {
       ctx.strokeStyle = '#e74c3c';
       ctx.lineWidth = 2;
       ctx.strokeRect(st.selection.x * cellSize, st.selection.y * cellSize, st.selection.w * cellSize, st.selection.h * cellSize);
+    }
+
+    // 移动中的浮动内容（原位置已清空，内容跟着鼠标走）
+    const mv = moveRef.current;
+    if (mv) {
+      ctx.save();
+      ctx.globalAlpha = 0.85;
+      for (let r = 0; r < mv.h; r++) {
+        for (let cc = 0; cc < mv.w; cc++) {
+          const tx = mv.origX + mv.dx + cc;
+          const ty = mv.origY + mv.dy + r;
+          if (tx < 0 || ty < 0 || tx >= cols || ty >= rows) continue;
+          ctx.fillStyle = palette[mv.buf[r * mv.w + cc]]?.hex ?? '#ffffff';
+          ctx.fillRect(tx * cellSize, ty * cellSize, cellSize, cellSize);
+        }
+      }
+      ctx.restore();
     }
 
     ctx.restore();
@@ -302,6 +339,33 @@ export default function CanvasGrid() {
     if (!cell) return;
 
     if (tool === 'select') {
+      const sel = selection;
+      if (sel && cell.x >= sel.x && cell.x < sel.x + sel.w && cell.y >= sel.y && cell.y < sel.y + sel.h) {
+        // 点在已有选区内 → 整块拖动
+        if (selectionTooLarge(sel)) {
+          useChartStore.getState().notify(
+            `选区太大（${sel.w}×${sel.h}，共 ${sel.w * sel.h} 格），一次最多移动 ${MAX_SELECTION_CELLS} 格`,
+            'warn'
+          );
+          return;
+        }
+        moveRef.current = {
+          buf: extractRegion(c.cells, c.cols, sel),
+          w: sel.w,
+          h: sel.h,
+          origX: sel.x,
+          origY: sel.y,
+          startClientX: e.clientX,
+          startClientY: e.clientY,
+          dx: 0,
+          dy: 0,
+        };
+        // 原位置先清成底色，松手时再把内容贴到新位置
+        const cleared = fillRegion(c.cells, c.cols, sel, 0);
+        useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: cleared }));
+        needsRedrawRef.current = true;
+        return;
+      }
       setIsSelecting(true);
       startCellRef.current = cell;
       setSelection(null);
@@ -339,8 +403,31 @@ export default function CanvasGrid() {
       return;
     }
 
+    // 选区移动中：用像素位移换算格数，鼠标移出画布也能继续拖
+    const mv = moveRef.current;
+    if (mv) {
+      const cellPx = BASE_CELL * stateRef.current.scale;
+      mv.dx = Math.round((e.clientX - mv.startClientX) / cellPx);
+      mv.dy = Math.round((e.clientY - mv.startClientY) / cellPx);
+      setSelection({ x: mv.origX + mv.dx, y: mv.origY + mv.dy, w: mv.w, h: mv.h });
+      needsRedrawRef.current = true;
+      return;
+    }
+
     const cell = getCellFromEvent(e);
-    if (!cell) return;
+    if (!cell) {
+      if (hoverInSel) setHoverInSel(false);
+      return;
+    }
+
+    // 选择工具下指针悬停在选区内时显示移动光标
+    if (tool === 'select' && selection) {
+      const inside =
+        cell.x >= selection.x && cell.x < selection.x + selection.w && cell.y >= selection.y && cell.y < selection.y + selection.h;
+      if (inside !== hoverInSel) setHoverInSel(inside);
+    } else if (hoverInSel) {
+      setHoverInSel(false);
+    }
 
     if (isSelecting && startCellRef.current) {
       const sc = startCellRef.current;
@@ -378,14 +465,63 @@ export default function CanvasGrid() {
     }
   };
 
+  // 松手提交移动：越界部分裁掉并提示；完全移出画布则拦截并还原
+  const commitMove = useCallback((e: { clientX: number; clientY: number }) => {
+    const mv = moveRef.current;
+    moveRef.current = null;
+    const c = stateRef.current.chart;
+    if (!mv || !c) return;
+    const store = useChartStore.getState();
+    const cellPx = BASE_CELL * stateRef.current.scale;
+    const nx = mv.origX + Math.round((e.clientX - mv.startClientX) / cellPx);
+    const ny = mv.origY + Math.round((e.clientY - mv.startClientY) / cellPx);
+
+    const clamped = clampRectToCanvas({ x: nx, y: ny, w: mv.w, h: mv.h }, c.cols, c.rows);
+    if (!clamped) {
+      const restored = blitRegion(c.cells, c.cols, c.rows, mv.buf, mv.w, mv.h, mv.origX, mv.origY);
+      store.updateChart(c.id, (ch) => ({ ...ch, cells: restored.cells }));
+      setSelection({ x: mv.origX, y: mv.origY, w: mv.w, h: mv.h });
+      store.notify('选区已完全移出画布，无法移动，已还原到原位置', 'warn');
+      return;
+    }
+    const { cells, clipped } = blitRegion(c.cells, c.cols, c.rows, mv.buf, mv.w, mv.h, nx, ny);
+    store.updateChart(c.id, (ch) => ({ ...ch, cells }));
+    setSelection(clamped);
+    if (clipped > 0) {
+      store.notify(`已移动选区，画布外的 ${clipped} 格被裁掉`, 'info');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只用到 ref 与稳定的 store action
+  }, []);
+
+  // 移动中即使在画布外（或其他按钮上）松开鼠标也要提交，否则已清空的原位置会丢内容
+  useEffect(() => {
+    const onUp = (e: MouseEvent) => {
+      if (moveRef.current) commitMove(e);
+    };
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, [commitMove]);
+
   const handleMouseUp = (e: React.MouseEvent) => {
     if (isDragging) {
       setIsDragging(false);
       setLastPanPoint(null);
       return;
     }
+    if (moveRef.current) {
+      commitMove(e);
+      return;
+    }
     if (isSelecting) {
       setIsSelecting(false);
+      const sel = useChartStore.getState().selection;
+      if (sel && selectionTooLarge(sel)) {
+        setSelection(null);
+        useChartStore.getState().notify(
+          `选区太大（${sel.w}×${sel.h}，共 ${sel.w * sel.h} 格），一次最多 ${MAX_SELECTION_CELLS} 格，请缩小框选范围`,
+          'warn'
+        );
+      }
       return;
     }
     const c = stateRef.current.chart;
@@ -429,46 +565,71 @@ export default function CanvasGrid() {
     e.preventDefault();
   };
 
-  // Copy / Paste shortcuts
+  // Copy / Paste / Delete / Esc shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // 输入框里不拦截按键（如重命名标题时的 Ctrl+C、Backspace）
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      const store = useChartStore.getState();
       const st = stateRef.current;
       const c = st.chart;
       if (!c) return;
+
+      if (e.key === 'Escape') {
+        const mv = moveRef.current;
+        if (mv) {
+          // 取消移动：内容贴回原位置
+          moveRef.current = null;
+          const restored = blitRegion(c.cells, c.cols, c.rows, mv.buf, mv.w, mv.h, mv.origX, mv.origY);
+          store.updateChart(c.id, (ch) => ({ ...ch, cells: restored.cells }));
+          store.setSelection({ x: mv.origX, y: mv.origY, w: mv.w, h: mv.h });
+          store.notify('已取消移动，选区还原到原位置');
+        } else if (st.selection) {
+          store.setSelection(null);
+        }
+        return;
+      }
+
+      // 移动过程中不响应其他快捷键，避免操作到半清空的数据
+      if (moveRef.current) return;
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (st.selection) {
+          e.preventDefault();
+          store.clearSelectionToBackground();
+        }
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
         if (st.selection) {
-          const scols = st.selection.w;
-          const srows = st.selection.h;
-          const buf = new Uint16Array(scols * srows);
-          for (let r = 0; r < srows; r++) {
-            for (let cc = 0; cc < scols; cc++) {
-              const srcIdx = (st.selection.y + r) * c.cols + (st.selection.x + cc);
-              buf[r * scols + cc] = c.cells[srcIdx];
-            }
-          }
-          setClipboard({ cells: buf, cols: scols, rows: srows });
+          e.preventDefault();
+          store.copySelection();
         }
+        return;
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
-        const cb = useChartStore.getState().clipboard;
+        const cb = store.clipboard;
         if (cb && st.selection) {
+          e.preventDefault();
           const newCells = new Uint16Array(c.cells);
           for (let r = 0; r < cb.rows; r++) {
             for (let cc = 0; cc < cb.cols; cc++) {
               const tx = st.selection.x + cc;
               const ty = st.selection.y + r;
-              if (tx < c.cols && ty < c.rows) {
+              if (tx >= 0 && tx < c.cols && ty >= 0 && ty < c.rows) {
                 newCells[ty * c.cols + tx] = cb.cells[r * cb.cols + cc];
               }
             }
           }
-          useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
+          store.updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
         }
+        return;
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [setClipboard]);
+  }, []);
 
   return (
     <div
@@ -477,7 +638,13 @@ export default function CanvasGrid() {
         flex: 1,
         overflow: 'hidden',
         position: 'relative',
-        cursor: isDragging ? 'grabbing' : tool === 'picker' ? 'crosshair' : 'default',
+        cursor: isDragging
+          ? 'grabbing'
+          : tool === 'select' && selection && hoverInSel
+            ? 'move'
+            : tool === 'picker'
+              ? 'crosshair'
+              : 'default',
         background: '#f5f3ef',
       }}
     >
