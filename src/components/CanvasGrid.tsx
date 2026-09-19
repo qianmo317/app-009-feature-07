@@ -1,8 +1,19 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useChartStore } from '../store/chartStore';
 import type { Chart, Point, Rect } from '../types';
+import { moveRegion, clearRegion, pointInRect, invalidRectReason } from '../utils/selection';
 
 const BASE_CELL = 20;
+
+type Mode = 'idle' | 'drawing' | 'selecting' | 'moving' | 'panning';
+
+interface MoveGhost {
+  origin: Rect;
+  anchor: Point;
+  dx: number;
+  dy: number;
+  block: Uint16Array;
+}
 
 export default function CanvasGrid() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -13,10 +24,6 @@ export default function CanvasGrid() {
     scale,
     offset,
     mirrorAxis,
-    isDragging,
-    lastPanPoint,
-    selection,
-    isSelecting,
     showGrid,
     setScale,
     setOffset,
@@ -32,19 +39,21 @@ export default function CanvasGrid() {
   const chartRef = useRef<Chart | null>(null);
   chartRef.current = useChartStore.getState().charts.find((c) => c.id === useChartStore.getState().currentChartId) ?? null;
 
-  const drawingRef = useRef(false);
+  const modeRef = useRef<Mode>('idle');
   const startCellRef = useRef<Point | null>(null);
   const previewRef = useRef<Rect | null>(null);
   const currentCellsRef = useRef<Uint16Array | null>(null);
+  const moveGhostRef = useRef<MoveGhost | null>(null);
+  const edgeWarnedRef = useRef(false);
   const rafRef = useRef<number>(0);
   const needsRedrawRef = useRef(true);
 
-  // Keep latest values in refs for animation loop and event handlers
-  const stateRef = useRef({ chart: chartRef.current, scale, offset, showGrid, selection, tool, selectedColorIndex, mirrorAxis });
+  // Keep latest values in refs for animation loop
+  const stateRef = useRef({ chart: chartRef.current, scale, offset, showGrid, tool, selectedColorIndex, mirrorAxis });
   useEffect(() => {
-    stateRef.current = { chart: chartRef.current, scale, offset, showGrid, selection, tool, selectedColorIndex, mirrorAxis };
+    stateRef.current = { chart: chartRef.current, scale, offset, showGrid, tool, selectedColorIndex, mirrorAxis };
     needsRedrawRef.current = true;
-  }, [scale, offset, showGrid, selection, tool, selectedColorIndex, mirrorAxis]);
+  }, [scale, offset, showGrid, tool, selectedColorIndex, mirrorAxis]);
 
   // Subscribe to store changes for redraw without re-render
   useEffect(() => {
@@ -57,22 +66,33 @@ export default function CanvasGrid() {
     return unsub;
   }, []);
 
-  const getCellFromEvent = useCallback(
-    (e: React.MouseEvent | MouseEvent): Point | null => {
-      const canvas = canvasRef.current;
-      const st = stateRef.current;
-      if (!canvas || !st.chart) return null;
-      const rect = canvas.getBoundingClientRect();
-      const x = (e.clientX - rect.left) / st.scale - st.offset.x;
-      const y = (e.clientY - rect.top) / st.scale - st.offset.y;
-      const cellSize = BASE_CELL;
-      const col = Math.floor(x / cellSize);
-      const row = Math.floor(y / cellSize);
-      if (col < 0 || col >= st.chart.cols || row < 0 || row >= st.chart.rows) return null;
-      return { x: col, y: row };
-    },
-    []
-  );
+  // 切换图解时清掉选区与拖动残留
+  const currentChartId = useChartStore((s) => s.currentChartId);
+  useEffect(() => {
+    moveGhostRef.current = null;
+    modeRef.current = 'idle';
+    setSelection(null);
+  }, [currentChartId, setSelection]);
+
+  /** 未裁剪的格子坐标，拖到画布外时仍可取得（用于块移动） */
+  const getRawCellFromEvent = useCallback((e: MouseEvent): Point | null => {
+    const canvas = canvasRef.current;
+    const st = stateRef.current;
+    if (!canvas || !st.chart) return null;
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / st.scale - st.offset.x;
+    const y = (e.clientY - rect.top) / st.scale - st.offset.y;
+    return { x: Math.floor(x / BASE_CELL), y: Math.floor(y / BASE_CELL) };
+  }, []);
+
+  /** 裁剪在画布内的格子坐标，越界返回 null（用于绘制与框选起点） */
+  const getCellFromEvent = useCallback((e: MouseEvent): Point | null => {
+    const st = stateRef.current;
+    const cell = getRawCellFromEvent(e);
+    if (!cell || !st.chart) return null;
+    if (cell.x < 0 || cell.x >= st.chart.cols || cell.y < 0 || cell.y >= st.chart.rows) return null;
+    return cell;
+  }, [getRawCellFromEvent]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -110,10 +130,21 @@ export default function CanvasGrid() {
     for (let r = startRow; r < endRow; r++) {
       for (let cIdx = startCol; cIdx < endCol; cIdx++) {
         const idx = cells[r * cols + cIdx];
-        const color = palette[idx]?.hex ?? '#ffffff';
-        ctx.fillStyle = color;
+        ctx.fillStyle = palette[idx]?.hex ?? '#ffffff';
         ctx.fillRect(cIdx * cellSize, r * cellSize, cellSize, cellSize);
       }
+    }
+
+    const ghost = moveGhostRef.current;
+
+    // 整块拖动时，源区域先盖成“已搬走”的底色观感
+    if (ghost) {
+      const o = ghost.origin;
+      ctx.save();
+      ctx.globalAlpha = 0.8;
+      ctx.fillStyle = palette[0]?.hex ?? '#ffffff';
+      ctx.fillRect(o.x * cellSize, o.y * cellSize, o.w * cellSize, o.h * cellSize);
+      ctx.restore();
     }
 
     // Grid
@@ -153,7 +184,7 @@ export default function CanvasGrid() {
       }
     }
 
-    // Selection preview
+    // Shape preview (line / rect)
     if (previewRef.current) {
       const pr = previewRef.current;
       ctx.strokeStyle = '#3498db';
@@ -163,11 +194,52 @@ export default function CanvasGrid() {
       ctx.setLineDash([]);
     }
 
-    // Selection rect
-    if (st.selection) {
-      ctx.strokeStyle = '#e74c3c';
+    if (ghost) {
+      const o = ghost.origin;
+      const dstX = o.x + ghost.dx;
+      const dstY = o.y + ghost.dy;
+
+      // 源区域虚线灰框
+      ctx.strokeStyle = '#999';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.strokeRect(o.x * cellSize, o.y * cellSize, o.w * cellSize, o.h * cellSize);
+      ctx.setLineDash([]);
+
+      // 目标位置：只画与画布相交的格（落在外面的格子被裁掉）
+      const ix0 = Math.max(0, dstX);
+      const iy0 = Math.max(0, dstY);
+      const ix1 = Math.min(cols - 1, dstX + o.w - 1);
+      const iy1 = Math.min(rows - 1, dstY + o.h - 1);
+      const canPlace = ix0 <= ix1 && iy0 <= iy1;
+
+      if (canPlace) {
+        ctx.save();
+        ctx.globalAlpha = 0.95;
+        for (let y = iy0; y <= iy1; y++) {
+          for (let x = ix0; x <= ix1; x++) {
+            const idx = ghost.block[(y - dstY) * o.w + (x - dstX)];
+            ctx.fillStyle = palette[idx]?.hex ?? '#ffffff';
+            ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+          }
+        }
+        ctx.restore();
+      }
+
+      // 目标外接框：能落下蓝色，整块越界红色
+      ctx.strokeStyle = canPlace ? '#27ae60' : '#e74c3c';
       ctx.lineWidth = 2;
-      ctx.strokeRect(st.selection.x * cellSize, st.selection.y * cellSize, st.selection.w * cellSize, st.selection.h * cellSize);
+      ctx.setLineDash([6, 3]);
+      ctx.strokeRect(dstX * cellSize, dstY * cellSize, o.w * cellSize, o.h * cellSize);
+      ctx.setLineDash([]);
+    } else {
+      // Selection rect
+      const sel = useChartStore.getState().selection;
+      if (sel) {
+        ctx.strokeStyle = '#e74c3c';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(sel.x * cellSize, sel.y * cellSize, sel.w * cellSize, sel.h * cellSize);
+      }
     }
 
     ctx.restore();
@@ -279,141 +351,237 @@ export default function CanvasGrid() {
     return newCells;
   };
 
+  const beginBlockMove = (c: Chart, sel: Rect, cell: Point) => {
+    const block = new Uint16Array(sel.w * sel.h);
+    for (let y = 0; y < sel.h; y++) {
+      for (let x = 0; x < sel.w; x++) {
+        block[y * sel.w + x] = c.cells[(sel.y + y) * c.cols + (sel.x + x)];
+      }
+    }
+    moveGhostRef.current = { origin: { ...sel }, anchor: cell, dx: 0, dy: 0, block };
+    modeRef.current = 'moving';
+    needsRedrawRef.current = true;
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
+    const store = useChartStore.getState();
     const c = stateRef.current.chart;
     if (!c) return;
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
       setIsDragging(true);
       setLastPanPoint({ x: e.clientX, y: e.clientY });
+      modeRef.current = 'panning';
       return;
     }
     if (e.button === 2) {
-      const cell = getCellFromEvent(e);
+      const cell = getCellFromEvent(e.nativeEvent);
       if (cell) {
         const idx = c.cells[cell.y * c.cols + cell.x];
-        const paletteIdx = c.palette.findIndex((_, i) => i === idx);
-        if (paletteIdx >= 0) setSelectedColorIndex(paletteIdx);
+        if (idx >= 0 && idx < c.palette.length) setSelectedColorIndex(idx);
       }
       return;
     }
     if (e.button !== 0) return;
 
-    const cell = getCellFromEvent(e);
+    const cell = getCellFromEvent(e.nativeEvent);
     if (!cell) return;
 
-    if (tool === 'select') {
-      setIsSelecting(true);
-      startCellRef.current = cell;
-      setSelection(null);
+    const currentTool = stateRef.current.tool;
+
+    if (currentTool === 'select') {
+      const sel = store.selection;
+      if (sel && pointInRect(cell.x, cell.y, sel)) {
+        // 按在选区内：整块拖走
+        beginBlockMove(c, sel, cell);
+      } else {
+        // 按在选区外：重新框选（手一抖框错了直接重框，不必先取消）
+        modeRef.current = 'selecting';
+        setIsSelecting(true);
+        startCellRef.current = cell;
+        edgeWarnedRef.current = false;
+        setSelection(null);
+      }
       return;
     }
 
-    drawingRef.current = true;
+    modeRef.current = 'drawing';
     startCellRef.current = cell;
     currentCellsRef.current = new Uint16Array(c.cells);
 
-    if (tool === 'pencil' || tool === 'mirror') {
-      const newCells = paintCell(c, cell.x, cell.y, selectedColorIndex);
+    if (currentTool === 'pencil' || currentTool === 'mirror') {
+      const newCells = paintCell(c, cell.x, cell.y, stateRef.current.selectedColorIndex);
       if (newCells) {
         useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
       }
-    } else if (tool === 'bucket') {
-      const newCells = fillBucket(c, cell.x, cell.y, selectedColorIndex);
+    } else if (currentTool === 'bucket') {
+      const newCells = fillBucket(c, cell.x, cell.y, stateRef.current.selectedColorIndex);
       useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
-      drawingRef.current = false;
-    } else if (tool === 'line' || tool === 'rect') {
+      modeRef.current = 'idle';
+    } else if (currentTool === 'line' || currentTool === 'rect') {
       previewRef.current = { x: cell.x, y: cell.y, w: 1, h: 1 };
       needsRedrawRef.current = true;
     }
   };
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    const c = stateRef.current.chart;
-    if (!c) return;
+  /** 窗口级事件：拖到画布外（甚至离开 canvas）也能持续跟手 */
+  useEffect(() => {
+    const updateCursor = (e: MouseEvent) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const st = stateRef.current;
+      let cursor = 'default';
+      if (useChartStore.getState().isDragging) cursor = 'grabbing';
+      else if (moveGhostRef.current) cursor = 'grabbing';
+      else if (st.tool === 'select') {
+        const cell = getRawCellFromEvent(e);
+        const sel = useChartStore.getState().selection;
+        cursor = cell && sel && pointInRect(cell.x, cell.y, sel) ? 'move' : 'crosshair';
+      } else {
+        cursor = 'crosshair';
+      }
+      canvas.style.cursor = cursor;
+    };
 
-    if (isDragging && lastPanPoint) {
-      const dx = (e.clientX - lastPanPoint.x) / scale;
-      const dy = (e.clientY - lastPanPoint.y) / scale;
-      setOffset({ x: offset.x + dx, y: offset.y + dy });
-      setLastPanPoint({ x: e.clientX, y: e.clientY });
-      return;
-    }
+    const onMove = (e: MouseEvent) => {
+      const store = useChartStore.getState();
+      const c = stateRef.current.chart;
+      if (!c) return;
 
-    const cell = getCellFromEvent(e);
-    if (!cell) return;
+      if (store.isDragging && store.lastPanPoint) {
+        const dx = (e.clientX - store.lastPanPoint.x) / store.scale;
+        const dy = (e.clientY - store.lastPanPoint.y) / store.scale;
+        setOffset({ x: store.offset.x + dx, y: store.offset.y + dy });
+        setLastPanPoint({ x: e.clientX, y: e.clientY });
+        return;
+      }
 
-    if (isSelecting && startCellRef.current) {
-      const sc = startCellRef.current;
-      const x = Math.min(sc.x, cell.x);
-      const y = Math.min(sc.y, cell.y);
-      const w = Math.abs(cell.x - sc.x) + 1;
-      const h = Math.abs(cell.y - sc.y) + 1;
-      setSelection({ x, y, w, h });
-      return;
-    }
+      if (modeRef.current === 'selecting' && startCellRef.current) {
+        const raw = getRawCellFromEvent(e);
+        if (!raw) return;
+        const sc = startCellRef.current;
+        const ex = Math.max(0, Math.min(c.cols - 1, raw.x));
+        const ey = Math.max(0, Math.min(c.rows - 1, raw.y));
+        if ((raw.x < 0 || raw.x >= c.cols || raw.y < 0 || raw.y >= c.rows) && !edgeWarnedRef.current) {
+          edgeWarnedRef.current = true;
+          store.notify('选区不能超出画布，已贴边框选', 'warn');
+        }
+        setSelection({
+          x: Math.min(sc.x, ex),
+          y: Math.min(sc.y, ey),
+          w: Math.abs(ex - sc.x) + 1,
+          h: Math.abs(ey - sc.y) + 1,
+        });
+        return;
+      }
 
-    if (!drawingRef.current || !startCellRef.current) return;
+      if (modeRef.current === 'moving' && moveGhostRef.current) {
+        const raw = getRawCellFromEvent(e);
+        if (!raw) return;
+        const g = moveGhostRef.current;
+        g.dx = raw.x - g.anchor.x;
+        g.dy = raw.y - g.anchor.y;
+        needsRedrawRef.current = true;
+        return;
+      }
 
-    if (tool === 'pencil' || tool === 'mirror') {
-      const newCells = paintCell(c, cell.x, cell.y, selectedColorIndex);
-      if (newCells) {
+      if (modeRef.current !== 'drawing' || !startCellRef.current) {
+        updateCursor(e);
+        return;
+      }
+
+      const cell = getCellFromEvent(e);
+      if (!cell) return;
+      const currentTool = stateRef.current.tool;
+
+      if (currentTool === 'pencil' || currentTool === 'mirror') {
+        const newCells = paintCell(c, cell.x, cell.y, stateRef.current.selectedColorIndex);
+        if (newCells) {
+          useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
+        }
+      } else if (currentTool === 'line' || currentTool === 'rect') {
+        previewRef.current = {
+          x: Math.min(startCellRef.current.x, cell.x),
+          y: Math.min(startCellRef.current.y, cell.y),
+          w: Math.abs(cell.x - startCellRef.current.x) + 1,
+          h: Math.abs(cell.y - startCellRef.current.y) + 1,
+        };
+        needsRedrawRef.current = true;
+      }
+    };
+
+    const onUp = (e: MouseEvent) => {
+      const store = useChartStore.getState();
+      if (store.isDragging) {
+        setIsDragging(false);
+        setLastPanPoint(null);
+        modeRef.current = 'idle';
+        return;
+      }
+
+      if (modeRef.current === 'selecting') {
+        modeRef.current = 'idle';
+        setIsSelecting(false);
+        return;
+      }
+
+      if (modeRef.current === 'moving') {
+        const g = moveGhostRef.current;
+        const c = stateRef.current.chart;
+        modeRef.current = 'idle';
+        moveGhostRef.current = null;
+        if (!c || !g) {
+          needsRedrawRef.current = true;
+          return;
+        }
+        if (g.dx === 0 && g.dy === 0) {
+          needsRedrawRef.current = true;
+          return;
+        }
+        const result = moveRegion(c, g.origin, g.dx, g.dy);
+        if ('error' in result) {
+          store.notify(result.error, 'warn');
+        } else {
+          useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: result.cells }));
+          setSelection(result.destRect);
+          if (result.discarded > 0) {
+            store.notify(`已挪到新位置，画布外 ${result.discarded} 格被裁掉`, 'warn');
+          }
+        }
+        needsRedrawRef.current = true;
+        return;
+      }
+
+      if (modeRef.current !== 'drawing') return;
+      const c = stateRef.current.chart;
+      if (!c || !startCellRef.current) {
+        modeRef.current = 'idle';
+        return;
+      }
+
+      const cell = getCellFromEvent(e);
+      const currentTool = stateRef.current.tool;
+      if (cell && currentTool === 'line') {
+        const newCells = drawLine(c, startCellRef.current.x, startCellRef.current.y, cell.x, cell.y, stateRef.current.selectedColorIndex);
+        useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
+      } else if (cell && currentTool === 'rect') {
+        const newCells = drawRect(c, startCellRef.current.x, startCellRef.current.y, cell.x, cell.y, stateRef.current.selectedColorIndex);
         useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
       }
-    } else if (tool === 'line') {
-      previewRef.current = {
-        x: Math.min(startCellRef.current.x, cell.x),
-        y: Math.min(startCellRef.current.y, cell.y),
-        w: Math.abs(cell.x - startCellRef.current.x) + 1,
-        h: Math.abs(cell.y - startCellRef.current.y) + 1,
-      };
-      needsRedrawRef.current = true;
-    } else if (tool === 'rect') {
-      previewRef.current = {
-        x: Math.min(startCellRef.current.x, cell.x),
-        y: Math.min(startCellRef.current.y, cell.y),
-        w: Math.abs(cell.x - startCellRef.current.x) + 1,
-        h: Math.abs(cell.y - startCellRef.current.y) + 1,
-      };
-      needsRedrawRef.current = true;
-    }
-  };
 
-  const handleMouseUp = (e: React.MouseEvent) => {
-    if (isDragging) {
-      setIsDragging(false);
-      setLastPanPoint(null);
-      return;
-    }
-    if (isSelecting) {
-      setIsSelecting(false);
-      return;
-    }
-    const c = stateRef.current.chart;
-    if (!drawingRef.current || !c || !startCellRef.current) return;
-
-    const cell = getCellFromEvent(e);
-    if (!cell) {
-      drawingRef.current = false;
+      modeRef.current = 'idle';
       startCellRef.current = null;
       previewRef.current = null;
+      currentCellsRef.current = null;
       needsRedrawRef.current = true;
-      return;
-    }
+    };
 
-    if (tool === 'line') {
-      const newCells = drawLine(c, startCellRef.current.x, startCellRef.current.y, cell.x, cell.y, selectedColorIndex);
-      useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
-    } else if (tool === 'rect') {
-      const newCells = drawRect(c, startCellRef.current.x, startCellRef.current.y, cell.x, cell.y, selectedColorIndex);
-      useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
-    }
-
-    drawingRef.current = false;
-    startCellRef.current = null;
-    previewRef.current = null;
-    currentCellsRef.current = null;
-    needsRedrawRef.current = true;
-  };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [getCellFromEvent, getRawCellFromEvent, setIsDragging, setIsSelecting, setLastPanPoint, setOffset, setSelection]);
 
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
@@ -429,46 +597,94 @@ export default function CanvasGrid() {
     e.preventDefault();
   };
 
-  // Copy / Paste shortcuts
+  // 键盘：复制/粘贴、方向键整块微移、Delete 清底色、Esc 取消框选
   useEffect(() => {
+    const isEditable = (el: EventTarget | null) =>
+      el instanceof HTMLElement && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+
+    const nudge = (c: Chart, sel: Rect, dx: number, dy: number) => {
+      const result = moveRegion(c, sel, dx, dy);
+      const store = useChartStore.getState();
+      if ('error' in result) {
+        store.notify(result.error, 'warn');
+        return;
+      }
+      store.updateChart(c.id, (ch) => ({ ...ch, cells: result.cells }));
+      store.setSelection(result.destRect);
+      if (result.discarded > 0) {
+        store.notify(`画布外 ${result.discarded} 格被裁掉，已经挪不动了`, 'warn');
+      }
+    };
+
     const onKeyDown = (e: KeyboardEvent) => {
-      const st = stateRef.current;
-      const c = st.chart;
+      if (isEditable(e.target)) return;
+      const store = useChartStore.getState();
+      const c = store.getCurrentChart();
       if (!c) return;
+
       if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
-        if (st.selection) {
-          const scols = st.selection.w;
-          const srows = st.selection.h;
-          const buf = new Uint16Array(scols * srows);
-          for (let r = 0; r < srows; r++) {
-            for (let cc = 0; cc < scols; cc++) {
-              const srcIdx = (st.selection.y + r) * c.cols + (st.selection.x + cc);
-              buf[r * scols + cc] = c.cells[srcIdx];
+        if (store.selection) {
+          const s = store.selection;
+          const buf = new Uint16Array(s.w * s.h);
+          for (let r = 0; r < s.h; r++) {
+            for (let cc = 0; cc < s.w; cc++) {
+              buf[r * s.w + cc] = c.cells[(s.y + r) * c.cols + (s.x + cc)];
             }
           }
-          setClipboard({ cells: buf, cols: scols, rows: srows });
+          setClipboard({ cells: buf, cols: s.w, rows: s.h });
+          store.notify('已复制选区');
         }
+        return;
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
-        const cb = useChartStore.getState().clipboard;
-        if (cb && st.selection) {
+        const cb = store.clipboard;
+        if (cb && store.selection) {
           const newCells = new Uint16Array(c.cells);
           for (let r = 0; r < cb.rows; r++) {
             for (let cc = 0; cc < cb.cols; cc++) {
-              const tx = st.selection.x + cc;
-              const ty = st.selection.y + r;
+              const tx = store.selection.x + cc;
+              const ty = store.selection.y + r;
               if (tx < c.cols && ty < c.rows) {
                 newCells[ty * c.cols + tx] = cb.cells[r * cb.cols + cc];
               }
             }
           }
-          useChartStore.getState().updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
+          store.updateChart(c.id, (ch) => ({ ...ch, cells: newCells }));
         }
+        return;
       }
+
+      const sel = store.selection;
+      if (store.tool !== 'select' || !sel) return;
+
+      if (e.key === 'Escape') {
+        setSelection(null);
+        moveGhostRef.current = null;
+        needsRedrawRef.current = true;
+        return;
+      }
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        const reason = invalidRectReason(c, sel);
+        if (reason) {
+          store.notify(reason, 'warn');
+          return;
+        }
+        store.updateChart(c.id, (ch) => ({ ...ch, cells: clearRegion(ch, sel) }));
+        store.notify('选区已整块清成底色');
+        return;
+      }
+
+      const step = e.shiftKey ? 10 : 1;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); nudge(c, sel, -step, 0); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); nudge(c, sel, step, 0); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); nudge(c, sel, 0, -step); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); nudge(c, sel, 0, step); }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [setClipboard]);
+  }, [setClipboard, setSelection]);
 
   return (
     <div
@@ -477,17 +693,14 @@ export default function CanvasGrid() {
         flex: 1,
         overflow: 'hidden',
         position: 'relative',
-        cursor: isDragging ? 'grabbing' : tool === 'picker' ? 'crosshair' : 'default',
         background: '#f5f3ef',
+        userSelect: 'none',
       }}
     >
       <canvas
         ref={canvasRef}
         style={{ display: 'block', width: '100%', height: '100%' }}
         onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
         onWheel={handleWheel}
         onContextMenu={handleContextMenu}
       />

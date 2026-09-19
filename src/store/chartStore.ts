@@ -22,6 +22,9 @@ function createEmptyChart(cols = 64, rows = 64, title = '未命名图解'): Char
   };
 }
 
+export type ToastKind = 'info' | 'warn';
+export type Toast = { id: string; text: string; kind: ToastKind };
+
 interface AppState {
   charts: Chart[];
   currentChartId: string | null;
@@ -36,6 +39,7 @@ interface AppState {
   selection: Rect | null;
   isSelecting: boolean;
   showGrid: boolean;
+  toasts: Toast[];
 }
 
 interface AppActions {
@@ -56,6 +60,8 @@ interface AppActions {
   setSelection: (r: Rect | null) => void;
   setIsSelecting: (v: boolean) => void;
   setShowGrid: (v: boolean) => void;
+  notify: (text: string, kind?: ToastKind) => void;
+  dismissToast: (id: string) => void;
   getCurrentChart: () => Chart | null;
 }
 
@@ -75,6 +81,7 @@ export const useChartStore = create<AppState & AppActions>()(
       selection: null,
       isSelecting: false,
       showGrid: true,
+      toasts: [],
 
       createChart: (cols, rows, title) => {
         const chart = createEmptyChart(cols, rows, title);
@@ -125,6 +132,16 @@ export const useChartStore = create<AppState & AppActions>()(
       setSelection: (selection) => set({ selection }),
       setIsSelecting: (isSelecting) => set({ isSelecting }),
       setShowGrid: (showGrid) => set({ showGrid }),
+
+      notify: (text, kind = 'info') => {
+        const id = generateId();
+        set((s) => ({ toasts: [...s.toasts, { id, text, kind }] }));
+        window.setTimeout(() => {
+          set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+        }, 2600);
+      },
+
+      dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
       getCurrentChart: () => {
         const { charts, currentChartId } = get();

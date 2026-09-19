@@ -6,6 +6,8 @@ import CanvasInfo from '../components/CanvasInfo';
 import Toolbar from '../components/Toolbar';
 import RightPanel from '../components/RightPanel';
 import StatusBar from '../components/StatusBar';
+import SelectionToolbar from '../components/SelectionToolbar';
+import Toasts from '../components/Toasts';
 
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
@@ -49,7 +51,7 @@ export default function Editor() {
           style={{ flex: 1, fontSize: 16, fontWeight: 500, border: 'none', outline: 'none', background: 'transparent' }}
         />
         <div style={{ fontSize: 12, color: '#888' }}>
-          空格拖拽 · 滚轮缩放 · 右键吸色 · Ctrl+C/V 复制粘贴
+          空格拖拽 · 滚轮缩放 · 右键吸色 · 框选后可拖动/填色/翻转/清除 · Delete 清除 · 方向键移动 · Esc 取消框选
         </div>
       </header>
       <StatusBar />
@@ -57,6 +59,8 @@ export default function Editor() {
         <Toolbar />
         <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
           <CanvasGrid />
+          <SelectionToolbar />
+          <Toasts />
           <CanvasInfo />
         </div>
         <RightPanel />
